@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/llama.dir/main.cpp.o -o llama  /usr/lib/x86_64-linux-gnu/libvulkan.so

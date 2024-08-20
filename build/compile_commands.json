@@ -1,0 +1,8 @@
+[
+{
+  "directory": "/home/wimaxs/Desktop/llama.hlsl/build",
+  "command": "/usr/bin/c++   -g -std=gnu++17 -o CMakeFiles/llama.dir/main.cpp.o -c /home/wimaxs/Desktop/llama.hlsl/main.cpp",
+  "file": "/home/wimaxs/Desktop/llama.hlsl/main.cpp",
+  "output": "CMakeFiles/llama.dir/main.cpp.o"
+}
+]
