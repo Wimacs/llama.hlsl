@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.12)
-project(llm.hlsl)
+project(llama.hlsl)
 
 # 设置C++版本
 set(CMAKE_CXX_STANDARD 17)
@@ -20,9 +20,9 @@ add_subdirectory(DXSample)
 target_include_directories(ImGui PUBLIC third_party/imgui third_party/imgui/backends)
 
 
-file(GLOB SOURCES src/*.cpp src/*.h)
+file(GLOB SOURCES src/*.cpp src/*.c src/*.h)
 
-add_executable(llm.hlsl ${SOURCES})
-set_target_properties(llm.hlsl PROPERTIES LINK_FLAGS "/SUBSYSTEM:WINDOWS")
+add_executable(llama.hlsl ${SOURCES})
+set_target_properties(llama.hlsl PROPERTIES LINK_FLAGS "/SUBSYSTEM:WINDOWS")
 
-target_link_libraries(llm.hlsl PRIVATE d3d12 dxgi dxguid D3DCompiler DXSample ImGui)
+target_link_libraries(llama.hlsl PRIVATE d3d12 dxgi dxguid D3DCompiler DXSample ImGui)
