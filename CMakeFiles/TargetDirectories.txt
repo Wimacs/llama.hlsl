@@ -1,3 +1,0 @@
-/home/wimaxs/Desktop/llama.hlsl/CMakeFiles/llama.dir
-/home/wimaxs/Desktop/llama.hlsl/CMakeFiles/edit_cache.dir
-/home/wimaxs/Desktop/llama.hlsl/CMakeFiles/rebuild_cache.dir
