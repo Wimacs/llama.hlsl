@@ -20,9 +20,9 @@
 // change and 0 will be returned.
 #define InterlockedGetValue(object) InterlockedCompareExchange(object, 0, 0)
 
-const float D3D12nBodyGravity::ParticleSpread = 400.0f;
+const float D3D12llm::ParticleSpread = 400.0f;
 
-D3D12nBodyGravity::D3D12nBodyGravity(UINT width, UINT height, std::wstring name) :
+D3D12llm::D3D12llm(UINT width, UINT height, std::wstring name, Transformer* t) :
     DXSample(width, height, name),
     m_frameIndex(0),
     m_viewport(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height)),
@@ -33,7 +33,8 @@ D3D12nBodyGravity::D3D12nBodyGravity(UINT width, UINT height, std::wstring name)
     m_renderContextFenceValue(0),
     m_terminating(0),
     m_srvIndex{},
-    m_frameFenceValues{}
+    m_frameFenceValues{},
+	tansformer(t)
 {
     for (int n = 0; n < ThreadCount; n++)
     {
@@ -53,7 +54,7 @@ D3D12nBodyGravity::D3D12nBodyGravity(UINT width, UINT height, std::wstring name)
     ThrowIfFailed(DXGIDeclareAdapterRemovalSupport());
 }
 
-void D3D12nBodyGravity::OnInit()
+void D3D12llm::OnInit()
 {
     m_camera.Init({ 0.0f, 0.0f, 1500.0f });
     m_camera.SetMoveSpeed(250.0f);
@@ -65,7 +66,7 @@ void D3D12nBodyGravity::OnInit()
 }
 
 // Load the rendering pipeline dependencies.
-void D3D12nBodyGravity::LoadPipeline()
+void D3D12llm::LoadPipeline()
 {
     UINT dxgiFactoryFlags = 0;
 
@@ -195,7 +196,7 @@ void D3D12nBodyGravity::LoadPipeline()
 }
 
 // Load the sample assets.
-void D3D12nBodyGravity::LoadAssets()
+void D3D12llm::LoadAssets()
 {
     // Create the root signatures.
     {
@@ -407,7 +408,7 @@ void D3D12nBodyGravity::LoadAssets()
 }
 
 // Create the particle vertex buffer.
-void D3D12nBodyGravity::CreateVertexBuffer()
+void D3D12llm::CreateVertexBuffer()
 {
     std::vector<ParticleVertex> vertices;
     vertices.resize(ParticleCount);
@@ -449,13 +450,13 @@ void D3D12nBodyGravity::CreateVertexBuffer()
 }
 
 // Random percent value, from -1 to 1.
-float D3D12nBodyGravity::RandomPercent()
+float D3D12llm::RandomPercent()
 {
     float ret = static_cast<float>((rand() % 10000) - 5000);
     return ret / 5000.0f;
 }
 
-void D3D12nBodyGravity::LoadParticles(_Out_writes_(numParticles) Particle* pParticles, const XMFLOAT3& center, const XMFLOAT4& velocity, float spread, UINT numParticles)
+void D3D12llm::LoadParticles(_Out_writes_(numParticles) Particle* pParticles, const XMFLOAT3& center, const XMFLOAT4& velocity, float spread, UINT numParticles)
 {
     srand(0);
     for (UINT i = 0; i < numParticles; i++)
@@ -479,7 +480,7 @@ void D3D12nBodyGravity::LoadParticles(_Out_writes_(numParticles) Particle* pPart
 }
 
 // Create the position and velocity buffer shader resources.
-void D3D12nBodyGravity::CreateParticleBuffers()
+void D3D12llm::CreateParticleBuffers()
 {
     // Initialize the data in the buffers.
     std::vector<Particle> data;
@@ -578,7 +579,7 @@ void D3D12nBodyGravity::CreateParticleBuffers()
     }
 }
 
-void D3D12nBodyGravity::CreateAsyncContexts()
+void D3D12llm::CreateAsyncContexts()
 {
     for (UINT threadIndex = 0; threadIndex < ThreadCount; ++threadIndex)
     {
@@ -611,7 +612,7 @@ void D3D12nBodyGravity::CreateAsyncContexts()
 }
 
 // Update frame-based values.
-void D3D12nBodyGravity::OnUpdate()
+void D3D12llm::OnUpdate()
 {
     // Wait for the previous Present to complete.
     WaitForSingleObjectEx(m_swapChainEvent, 100, FALSE);
@@ -628,7 +629,7 @@ void D3D12nBodyGravity::OnUpdate()
 }
 
 // Render the scene.
-void D3D12nBodyGravity::OnRender()
+void D3D12llm::OnRender()
 {
     try
     {
@@ -677,7 +678,7 @@ void D3D12nBodyGravity::OnRender()
 }
 
 // Release sample's D3D objects.
-void D3D12nBodyGravity::ReleaseD3DResources()
+void D3D12llm::ReleaseD3DResources()
 {
     m_renderContextFence.Reset();
     ResetComPtrArray(&m_renderTargets);
@@ -687,7 +688,7 @@ void D3D12nBodyGravity::ReleaseD3DResources()
 }
 
 // Tears down D3D resources and reinitializes them.
-void D3D12nBodyGravity::RestoreD3DResources()
+void D3D12llm::RestoreD3DResources()
 {
     // Give GPU a chance to finish its execution in progress.
     try
@@ -703,7 +704,7 @@ void D3D12nBodyGravity::RestoreD3DResources()
 }
 
 // Wait for pending GPU work to complete.
-void D3D12nBodyGravity::WaitForGpu()
+void D3D12llm::WaitForGpu()
 {
     // Schedule a Signal command in the queue.
     ThrowIfFailed(m_commandQueue->Signal(m_renderContextFence.Get(), m_renderContextFenceValues[m_frameIndex]));
@@ -717,7 +718,7 @@ void D3D12nBodyGravity::WaitForGpu()
 }
 
 // Fill the command list with all the render commands and dependent state.
-void D3D12nBodyGravity::PopulateCommandList()
+void D3D12llm::PopulateCommandList()
 {
     // Command list allocators can only be reset when the associated
     // command lists have finished execution on the GPU; apps should use
@@ -763,7 +764,7 @@ void D3D12nBodyGravity::PopulateCommandList()
 	ThrowIfFailed(m_commandList->Close());
 }
 
-DWORD D3D12nBodyGravity::AsyncComputeThreadProc(int threadIndex)
+DWORD D3D12llm::AsyncComputeThreadProc(int threadIndex)
 {
     ID3D12CommandQueue* pCommandQueue = m_computeCommandQueue[threadIndex].Get();
     ID3D12CommandAllocator* pCommandAllocator = m_computeAllocator[threadIndex].Get();
@@ -808,7 +809,7 @@ DWORD D3D12nBodyGravity::AsyncComputeThreadProc(int threadIndex)
 }
 
 // Run the particle simulation using the compute shader.
-void D3D12nBodyGravity::Simulate(UINT threadIndex)
+void D3D12llm::Simulate(UINT threadIndex)
 {
     ID3D12GraphicsCommandList* pCommandList = m_computeCommandList[threadIndex].Get();
 
@@ -848,7 +849,7 @@ void D3D12nBodyGravity::Simulate(UINT threadIndex)
     pCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(pUavResource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
 }
 
-void D3D12nBodyGravity::OnDestroy()
+void D3D12llm::OnDestroy()
 {
     // Notify the compute threads that the app is shutting down.
     InterlockedExchange(&m_terminating, 1);
@@ -867,17 +868,17 @@ void D3D12nBodyGravity::OnDestroy()
     }
 }
 
-void D3D12nBodyGravity::OnKeyDown(UINT8 key)
+void D3D12llm::OnKeyDown(UINT8 key)
 {
     m_camera.OnKeyDown(key);
 }
 
-void D3D12nBodyGravity::OnKeyUp(UINT8 key)
+void D3D12llm::OnKeyUp(UINT8 key)
 {
     m_camera.OnKeyUp(key);
 }
 
-void D3D12nBodyGravity::WaitForRenderContext()
+void D3D12llm::WaitForRenderContext()
 {
     // Add a signal command to the queue.
     ThrowIfFailed(m_commandQueue->Signal(m_renderContextFence.Get(), m_renderContextFenceValue));
@@ -893,7 +894,7 @@ void D3D12nBodyGravity::WaitForRenderContext()
 // Cycle through the frame resources. This method blocks execution if the 
 // next frame resource in the queue has not yet had its previous contents 
 // processed by the GPU.
-void D3D12nBodyGravity::MoveToNextFrame()
+void D3D12llm::MoveToNextFrame()
 {
     // Assign the current fence value to the current frame.
     m_frameFenceValues[m_frameIndex] = m_renderContextFenceValue;
@@ -913,7 +914,7 @@ void D3D12nBodyGravity::MoveToNextFrame()
     }
 }
 
-void D3D12nBodyGravity::InitImGui()
+void D3D12llm::InitImGui()
 {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -928,7 +929,7 @@ void D3D12nBodyGravity::InitImGui()
         m_imGuiSrvDescHeap->GetGPUDescriptorHandleForHeapStart());
 }
 
-void D3D12nBodyGravity::RenderImGui()
+void D3D12llm::RenderImGui()
 {
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
