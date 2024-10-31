@@ -3,8 +3,144 @@
 #include "shaders/shared.h"
 
 // Windows DPI Scaling
+#include <iostream>
+#include <ostream>
 #include <ShellScalingApi.h>
+#include <vector>
+#include <fstream>
+#include <cstring>
+#include <fcntl.h>
+#include <cstdlib>
+#include <cmath>
+#include <io.h>   // For close()
+#include <fcntl.h> // For open() and O_RDONLY
+
 #pragma comment(lib, "shcore.lib")
+
+struct Config {
+	int dim;
+	int hidden_dim;
+	int n_layers;
+	int n_heads;
+	int n_kv_heads;
+	int vocab_size;
+	int seq_len;
+};
+
+struct TransformerWeights {
+	std::vector<float> token_embedding_table;
+	std::vector<float> rms_att_weight;
+	std::vector<float> rms_ffn_weight;
+	std::vector<float> wq;
+	std::vector<float> wk;
+	std::vector<float> wv;
+	std::vector<float> wo;
+	std::vector<float> w1;
+	std::vector<float> w2;
+	std::vector<float> w3;
+	std::vector<float> rms_final_weight;
+	std::vector<float> wcls;
+};
+
+struct RunState {
+	std::vector<float> x;
+	std::vector<float> xb;
+	std::vector<float> xb2;
+	std::vector<float> hb;
+	std::vector<float> hb2;
+	std::vector<float> q;
+	std::vector<float> att;
+	std::vector<float> logits;
+	std::vector<float> key_cache;
+	std::vector<float> value_cache;
+};
+
+struct Transformer {
+	Config config;
+	TransformerWeights weights;
+	RunState state;
+};
+
+void malloc_run_state(RunState& s, const Config& p) {
+	int kv_dim = (p.dim * p.n_kv_heads) / p.n_heads;
+
+	s.x.resize(p.dim);
+	s.xb.resize(p.dim);
+	s.xb2.resize(p.dim);
+	s.hb.resize(p.hidden_dim);
+	s.hb2.resize(p.hidden_dim);
+	s.q.resize(p.dim);
+	s.key_cache.resize(p.n_layers * p.seq_len * kv_dim);
+	s.value_cache.resize(p.n_layers * p.seq_len * kv_dim);
+	s.att.resize(p.n_heads * p.seq_len);
+	s.logits.resize(p.vocab_size);
+}
+
+void memory_map_weights(TransformerWeights& w, const Config& p, std::ifstream& file) {
+	int head_size = p.dim / p.n_heads;
+	unsigned long long n_layers = p.n_layers;
+
+	// Read weights from the file
+	w.token_embedding_table.resize(p.vocab_size * p.dim);
+	file.read(reinterpret_cast<char*>(w.token_embedding_table.data()), w.token_embedding_table.size() * sizeof(float));
+
+	w.rms_att_weight.resize(n_layers * p.dim);
+	file.read(reinterpret_cast<char*>(w.rms_att_weight.data()), w.rms_att_weight.size() * sizeof(float));
+
+	w.wq.resize(n_layers * p.dim * (p.n_heads * head_size));
+	file.read(reinterpret_cast<char*>(w.wq.data()), w.wq.size() * sizeof(float));
+
+	w.wk.resize(n_layers * p.dim * (p.n_kv_heads * head_size));
+	file.read(reinterpret_cast<char*>(w.wk.data()), w.wk.size() * sizeof(float));
+
+	w.wv.resize(n_layers * p.dim * (p.n_kv_heads * head_size));
+	file.read(reinterpret_cast<char*>(w.wv.data()), w.wv.size() * sizeof(float));
+
+	w.wo.resize(n_layers * (p.n_heads * head_size) * p.dim);
+	file.read(reinterpret_cast<char*>(w.wo.data()), w.wo.size() * sizeof(float));
+
+	w.rms_ffn_weight.resize(n_layers * p.dim);
+	file.read(reinterpret_cast<char*>(w.rms_ffn_weight.data()), w.rms_ffn_weight.size() * sizeof(float));
+
+	w.w1.resize(n_layers * p.dim * p.hidden_dim);
+	file.read(reinterpret_cast<char*>(w.w1.data()), w.w1.size() * sizeof(float));
+
+	w.w2.resize(n_layers * p.hidden_dim * p.dim);
+	file.read(reinterpret_cast<char*>(w.w2.data()), w.w2.size() * sizeof(float));
+
+	w.w3.resize(n_layers * p.dim * p.hidden_dim);
+	file.read(reinterpret_cast<char*>(w.w3.data()), w.w3.size() * sizeof(float));
+
+	w.rms_final_weight.resize(p.dim);
+	file.read(reinterpret_cast<char*>(w.rms_final_weight.data()), w.rms_final_weight.size() * sizeof(float));
+
+	// Optional classifier weights for the logits
+	w.wcls = w.token_embedding_table; // Or load different weights if needed
+}
+
+void read_checkpoint(const char* checkpoint, Config& config, TransformerWeights& weights) {
+	std::ifstream file(checkpoint, std::ios::binary);
+	if (!file) { std::cerr << "Couldn't open file " << checkpoint << std::endl; exit(EXIT_FAILURE); }
+
+	// Read in the config header
+	file.read(reinterpret_cast<char*>(&config), sizeof(Config));
+
+	// Adjust vocab size
+	int shared_weights = config.vocab_size > 0 ? 1 : 0;
+	config.vocab_size = std::abs(config.vocab_size);
+
+	// Memory map the Transformer weights into the weights structure
+	memory_map_weights(weights, config, file);
+}
+
+void build_transformer(Transformer& t, const char* checkpoint_path) {
+	read_checkpoint(checkpoint_path, t.config, t.weights);
+	malloc_run_state(t.state, t.config);
+}
+
+void free_transformer(Transformer& t) {
+	// No explicit free needed, std::vector will handle memory
+}
 
 const unsigned int frameWidth = 1820;
 const unsigned int frameHeight = 980;
@@ -583,6 +719,7 @@ private:
 #endif
 
 		// Find a suitable adapter to run D3D
+		//TODO: can be chosen by user
 		int i = 0;
 		IDXGIAdapter1* adapter = nullptr;
 		DXGI_ADAPTER_DESC1 selectedAdapterDesc = {};
@@ -602,7 +739,7 @@ private:
 
 					if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
 						selectedAdapterDesc = desc;
-						break;
+						//break;
 					}
 				}
 				SAFE_RELEASE(tempDevice);
@@ -1636,7 +1773,11 @@ HRESULT Create(LONG width, LONG height, HINSTANCE& instance, HWND& window, LPCWS
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow)
 {
 	HRESULT hr = EXIT_SUCCESS;
+	Transformer test;
+	std::wstring assetsFolderW = utils::getExePath() + L"assets\\" + L"stories15M.bin";
+	std::string assetsFolder = utils::wstringToString(assetsFolderW);
 
+	build_transformer(test, assetsFolder.c_str());
 	{
 		MSG msg = { 0 };
 		HWND hWnd = { 0 };
