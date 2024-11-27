@@ -19,5 +19,5 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
         sum += matrixA[DTid.y * MATRIX_WIDTH + k] * matrixB[k * MATRIX_WIDTH + DTid.x];
     }
     
-    result[DTid.y * MATRIX_WIDTH + DTid.x] = sum;
+    result[DTid.y * MATRIX_WIDTH + DTid.x] = matrixB[DTid.x];
 }

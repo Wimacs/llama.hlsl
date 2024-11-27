@@ -49,6 +49,84 @@ ComPtr<ID3D12Resource> readBackBuffer;
 ComPtr<ID3D12DescriptorHeap> computeHeap;
 UINT descriptorSize;
 
+
+typedef struct {
+    // token embedding table
+    ComPtr<ID3D12Resource> token_embedding_table;    // (vocab_size, dim)
+    // weights for rmsnorms
+    ComPtr<ID3D12Resource> rms_att_weight; // (layer, dim) rmsnorm weights
+    ComPtr<ID3D12Resource> rms_att_weight_upload;
+    ComPtr<ID3D12Resource> rms_ffn_weight; // (layer, dim)
+    // weights for matmuls. note dim == n_heads * head_size
+    ComPtr<ID3D12Resource> wq; // (layer, dim, n_heads * head_size)
+    ComPtr<ID3D12Resource> wk; // (layer, dim, n_kv_heads * head_size)
+    ComPtr<ID3D12Resource> wv; // (layer, dim, n_kv_heads * head_size)
+    ComPtr<ID3D12Resource> wo; // (layer, n_heads * head_size, dim)
+    // weights for ffn
+    ComPtr<ID3D12Resource> w1; // (layer, hidden_dim, dim)
+    ComPtr<ID3D12Resource> w2; // (layer, dim, hidden_dim)
+    ComPtr<ID3D12Resource> w3; // (layer, hidden_dim, dim)
+    // final rmsnorm
+    ComPtr<ID3D12Resource> rms_final_weight; // (dim,)
+    // (optional) classifier weights for the logits, on the last layer
+    ComPtr<ID3D12Resource> wcls;
+} TransformerWeightsGPU;
+
+typedef struct {
+    // token embedding table
+    float* token_embedding_table;    // (vocab_size, dim)
+    size_t token_embedding_table_size;
+    // weights for rmsnorms
+    float* rms_att_weight; // (layer, dim) rmsnorm weights
+    size_t rms_att_weight_size;
+    float* rms_ffn_weight; // (layer, dim)
+    size_t rms_ffn_weight_size;
+    // weights for matmuls. note dim == n_heads * head_size
+    float* wq; // (layer, dim, n_heads * head_size)
+    size_t wq_size;
+    float* wk; // (layer, dim, n_kv_heads * head_size)
+    size_t wk_size;
+    float* wv; // (layer, dim, n_kv_heads * head_size)
+    size_t wv_size;
+    float* wo; // (layer, n_heads * head_size, dim)
+    size_t wo_size;
+    // weights for ffn
+    float* w1; // (layer, hidden_dim, dim)
+    size_t w1_size;
+    float* w2; // (layer, dim, hidden_dim)
+    size_t w2_size;
+    float* w3; // (layer, hidden_dim, dim)
+    size_t w3_size;
+    // final rmsnorm
+    float* rms_final_weight; // (dim,)
+    size_t rms_final_weight_size;
+    // (optional) classifier weights for the logits, on the last layer
+    float* wcls;
+    size_t wcls_size;
+} TransformerWeights;
+
+
+typedef struct {
+    int dim; // transformer dimension
+    int hidden_dim; // for ffn layers
+    int n_layers; // number of layers
+    int n_heads; // number of query heads
+    int n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
+    int vocab_size; // vocabulary size, usually 256 (byte-level)
+    int seq_len; // max sequence length
+} Config;
+
+typedef struct {
+    Config config;
+    TransformerWeights weights;
+    TransformerWeightsGPU weights_gpu;
+    // Windows特定的句柄
+    HANDLE file_handle;
+    float* data;
+    size_t file_size;
+} Transformer;
+
+
 void WaitForGpu() {
     const UINT64 currentFenceValue = fenceValue;
     commandQueue->Signal(fence.Get(), currentFenceValue);
@@ -89,7 +167,7 @@ ComPtr<IDXCoreAdapter1> GetAdapter() {
     }
 
     ComPtr<IDXCoreAdapterList> adapterList;
-    if (FAILED(factory->CreateAdapterList(1, &DXCORE_ADAPTER_ATTRIBUTE_D3D12_GENERIC_ML, 
+    if (FAILED(factory->CreateAdapterList(1, &DXCORE_ADAPTER_ATTRIBUTE_D3D12_CORE_COMPUTE, 
         IID_PPV_ARGS(&adapterList)))) {
         throw std::runtime_error("Failed to create adapter list");
     }
@@ -199,7 +277,7 @@ void CreateComputePipeline() {
     // Create root signature
     CD3DX12_ROOT_PARAMETER rootParameter;
     CD3DX12_DESCRIPTOR_RANGE ranges[1];
-    ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0); // 3 UAVs, starting register 0
+    ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 12 + 12, 0); // 12SRV, 12 UAVs, starting register 0
     rootParameter.InitAsDescriptorTable(1, ranges);
 
     CD3DX12_ROOT_SIGNATURE_DESC rootSignatureDesc;
@@ -278,7 +356,7 @@ void CreateComputePipeline() {
 
 
 // Create resource buffers
-void CreateResources() {
+void CreateResources(Transformer* transformer) {
     // Create matrix buffers
     auto heapProperties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
     auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(
@@ -313,6 +391,20 @@ void CreateResources() {
         IID_PPV_ARGS(&resultBuffer)
     );
 
+    auto TransformerDesc = CD3DX12_RESOURCE_DESC::Buffer(
+        transformer->weights.rms_att_weight_size * sizeof(float),
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+    );
+    device->CreateCommittedResource(
+        &heapProperties,
+        D3D12_HEAP_FLAG_NONE,
+        &TransformerDesc,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        nullptr,
+        IID_PPV_ARGS(&transformer->weights_gpu.rms_att_weight)
+    );
+
+
     // Create UAV descriptors
     D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
     uavDesc.Format = DXGI_FORMAT_UNKNOWN;
@@ -326,15 +418,24 @@ void CreateResources() {
     CD3DX12_CPU_DESCRIPTOR_HANDLE handle(computeHeap->GetCPUDescriptorHandleForHeapStart());
     
     device->CreateUnorderedAccessView(matrixABuffer.Get(), nullptr, &uavDesc, handle);
-    
+
+
+
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC transformerUavDesc = {};
+    transformerUavDesc.Format = DXGI_FORMAT_UNKNOWN;
+    transformerUavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    transformerUavDesc.Buffer.FirstElement = 0;
+    transformerUavDesc.Buffer.NumElements = transformer->weights.rms_att_weight_size;
+    transformerUavDesc.Buffer.StructureByteStride = sizeof(float);
+    transformerUavDesc.Buffer.CounterOffsetInBytes = 0;
+    transformerUavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+
     handle.Offset(descriptorSize);
-    device->CreateUnorderedAccessView(matrixBBuffer.Get(), nullptr, &uavDesc, handle);
-    
+    device->CreateUnorderedAccessView(transformer->weights_gpu.rms_att_weight.Get(), nullptr, &transformerUavDesc, handle);
+
     handle.Offset(descriptorSize);
     device->CreateUnorderedAccessView(resultBuffer.Get(), nullptr, &uavDesc, handle);
-
-
-    
 }
 
 // Create synchronization objects
@@ -344,7 +445,7 @@ void CreateSyncObjects() {
 }
 
 // Create upload and read back buffers
-void CreateUploadAndReadBackBuffers() {
+void CreateUploadAndReadBackBuffers(Transformer* transformer) {
     auto uploadHeapProperties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
     auto readbackHeapProperties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
     auto bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(MATRIX_ELEMENTS * sizeof(float));
@@ -359,7 +460,7 @@ void CreateUploadAndReadBackBuffers() {
         IID_PPV_ARGS(&uploadBufferA)
     );
 
-    device->CreateCommittedResource(
+    auto hr = device->CreateCommittedResource(
         &uploadHeapProperties,
         D3D12_HEAP_FLAG_NONE,
         &bufferDesc,
@@ -367,6 +468,7 @@ void CreateUploadAndReadBackBuffers() {
         nullptr,
         IID_PPV_ARGS(&uploadBufferB)
     );
+    std::cout << std::to_string(hr);
 
     // Create read back buffer
     device->CreateCommittedResource(
@@ -377,10 +479,21 @@ void CreateUploadAndReadBackBuffers() {
         nullptr,
         IID_PPV_ARGS(&readBackBuffer)
     );
+
+    auto TransformerDesc = CD3DX12_RESOURCE_DESC::Buffer(transformer->weights.rms_att_weight_size * sizeof(float));
+
+    device->CreateCommittedResource(
+        &uploadHeapProperties,
+        D3D12_HEAP_FLAG_NONE,
+        &TransformerDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&transformer->weights_gpu.rms_att_weight_upload)
+    );
 }
 
 // Upload matrix data to GPU
-void UploadMatrixData(const std::vector<float>& matrixA, const std::vector<float>& matrixB) {
+void UploadMatrixData(const std::vector<float>& matrixA, const std::vector<float>& matrixB, Transformer* transformer) {
     // Map and copy data to upload buffers
     void* mappedData;
     uploadBufferA->Map(0, nullptr, &mappedData);
@@ -390,6 +503,10 @@ void UploadMatrixData(const std::vector<float>& matrixA, const std::vector<float
     uploadBufferB->Map(0, nullptr, &mappedData);
     memcpy(mappedData, matrixB.data(), MATRIX_ELEMENTS * sizeof(float));
     uploadBufferB->Unmap(0, nullptr);
+
+    transformer->weights_gpu.rms_att_weight_upload->Map(0, nullptr, &mappedData);
+    memcpy(mappedData, transformer->weights.rms_att_weight, transformer->weights.rms_att_weight_size * sizeof(float));
+    transformer->weights_gpu.rms_att_weight_upload->Unmap(0, nullptr);
 
     // Record copy commands
     commandList->Reset(commandAllocator.Get(), nullptr);
@@ -408,8 +525,16 @@ void UploadMatrixData(const std::vector<float>& matrixA, const std::vector<float
     );
     commandList->ResourceBarrier(1, &barrier);
 
+    barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+        transformer->weights_gpu.rms_att_weight.Get(),
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_DEST
+    );
+    commandList->ResourceBarrier(1, &barrier);
+
     commandList->CopyResource(matrixABuffer.Get(), uploadBufferA.Get());
     commandList->CopyResource(matrixBBuffer.Get(), uploadBufferB.Get());
+    commandList->CopyResource(transformer->weights_gpu.rms_att_weight.Get(), transformer->weights_gpu.rms_att_weight_upload.Get());
 
     barrier = CD3DX12_RESOURCE_BARRIER::Transition(
         matrixABuffer.Get(),
@@ -470,7 +595,6 @@ void ExecuteCompute() {
     // Wait for computation to complete
     WaitForGpu();
 }
-
 // Read back computation result
 std::vector<float> ReadBackResult() {
     std::vector<float> result(MATRIX_ELEMENTS);
@@ -482,22 +606,176 @@ std::vector<float> ReadBackResult() {
 }
 
 
+void memory_map_weights(TransformerWeights* w, Config* p, float* ptr, int shared_weights) {
+    int head_size = p->dim / p->n_heads;
+    unsigned long long n_layers = p->n_layers;
+
+    w->token_embedding_table = ptr;
+    w->token_embedding_table_size = p->vocab_size * p->dim;
+    ptr += w->token_embedding_table_size;
+
+    w->rms_att_weight = ptr;
+    w->rms_att_weight_size = n_layers * p->dim;
+    ptr += w->rms_att_weight_size;
+
+    w->wq = ptr;
+    w->wq_size = n_layers * p->dim * (p->n_heads * head_size);
+    ptr += w->wq_size;
+
+    w->wk = ptr;
+    w->wk_size = n_layers * p->dim * (p->n_kv_heads * head_size);
+    ptr += w->wk_size;
+
+    w->wv = ptr;
+    w->wv_size = n_layers * p->dim * (p->n_kv_heads * head_size);
+    ptr += w->wv_size;
+
+    w->wo = ptr;
+    w->wo_size = n_layers * (p->n_heads * head_size) * p->dim;
+    ptr += w->wo_size;
+
+    w->rms_ffn_weight = ptr;
+    w->rms_ffn_weight_size = n_layers * p->dim;
+    ptr += w->rms_ffn_weight_size;
+
+    w->w1 = ptr;
+    w->w1_size = n_layers * p->dim * p->hidden_dim;
+    ptr += w->w1_size;
+
+    w->w2 = ptr;
+    w->w2_size = n_layers * p->hidden_dim * p->dim;
+    ptr += w->w2_size;
+
+    w->w3 = ptr;
+    w->w3_size = n_layers * p->dim * p->hidden_dim;
+    ptr += w->w3_size;
+
+    w->rms_final_weight = ptr;
+    w->rms_final_weight_size = p->dim;
+    ptr += w->rms_final_weight_size;
+
+    ptr += p->seq_len * head_size; // / skip what used to be freq_cis_real (for RoPE)
+
+    w->wcls = shared_weights ? w->token_embedding_table : ptr;
+    w->wcls_size = shared_weights ? 0 : p->vocab_size * p->dim;
+}
+
+void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
+    HANDLE* file_handle, float** data, size_t* file_size) {
+    FILE* file = fopen(checkpoint, "rb");
+    if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); exit(EXIT_FAILURE); }
+
+    // 读取配置信息
+    if (fread(config, sizeof(Config), 1, file) != 1) { exit(EXIT_FAILURE); }
+    int shared_weights = config->vocab_size > 0 ? 1 : 0;
+    config->vocab_size = abs(config->vocab_size);
+
+    // 获取文件大小
+    fseek(file, 0, SEEK_END);
+    *file_size = ftell(file);
+    fclose(file);
+
+    *file_handle = CreateFileA(checkpoint, GENERIC_READ, FILE_SHARE_READ, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (*file_handle == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "CreateFile failed!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    HANDLE mapping = CreateFileMapping(*file_handle, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (mapping == NULL) {
+        CloseHandle(*file_handle);
+        fprintf(stderr, "CreateFileMapping failed!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    *data = (float*)MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(mapping); // 映射视图创建后可以关闭mapping句柄
+
+    if (*data == NULL) {
+        CloseHandle(*file_handle);
+        fprintf(stderr, "MapViewOfFile failed!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // 设置权重指针
+    float* weights_ptr = *data + sizeof(Config) / sizeof(float);
+    memory_map_weights(weights, config, weights_ptr, shared_weights);
+}
+
+void free_transformer(Transformer* t) {
+    if (t->data != NULL) {
+        UnmapViewOfFile(t->data);
+    }
+    if (t->file_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(t->file_handle);
+    }
+}
+
+void error_usage() {
+    fprintf(stderr, "Usage:   run <checkpoint> [options]\n");
+    fprintf(stderr, "Example: run model.bin -n 256 -i \"Once upon a time\"\n");
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
+    fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
+    fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
+    fprintf(stderr, "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n");
+    fprintf(stderr, "  -i <string> input prompt\n");
+    fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
+    fprintf(stderr, "  -m <string> mode: generate|chat, default: generate\n");
+    fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
+    exit(EXIT_FAILURE);
+}
+
 
 // Main function example
-int main() {
+int main(int argc, char* argv[]) {
     // Initialize
+        // default parameters
+    char* checkpoint_path = "../model/stories110M.bin";  // e.g. out/model.bin
+    char* tokenizer_path = "../model/tokenizer.bin";
+    float temperature = 1.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
+    float topp = 0.9f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
+    int steps = 256;            // number of steps to run for
+    char* prompt = NULL;        // prompt string
+    unsigned long long rng_seed = 0; // seed rng with time by default
+    char* mode = "generate";    // generate|chat
+    char* system_prompt = NULL; // the (optional) system prompt to use in chat mode
+
+    // poor man's C argparse so we can override the defaults above from the command line
+    //if (argc >= 2) { checkpoint_path = argv[1]; }
+    //else { error_usage(); }
+    //for (int i = 2; i < argc; i += 2) {
+    //    // do some basic validation
+    //    if (i + 1 >= argc) { error_usage(); } // must have arg after flag
+    //    if (argv[i][0] != '-') { error_usage(); } // must start with dash
+    //    if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
+    //    // read in the args
+    //    if (argv[i][1] == 't') { temperature = atof(argv[i + 1]); }
+    //    else if (argv[i][1] == 'p') { topp = atof(argv[i + 1]); }
+    //    else if (argv[i][1] == 's') { rng_seed = atoi(argv[i + 1]); }
+    //    else if (argv[i][1] == 'n') { steps = atoi(argv[i + 1]); }
+    //    else if (argv[i][1] == 'i') { prompt = argv[i + 1]; }
+    //    else if (argv[i][1] == 'z') { tokenizer_path = argv[i + 1]; }
+    //    else if (argv[i][1] == 'm') { mode = argv[i + 1]; }
+    //    else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
+    //    else { error_usage(); }
+    //}
+    Transformer transformer;
+    read_checkpoint(checkpoint_path, &transformer.config, &transformer.weights, &transformer.file_handle, &transformer.data, &transformer.file_size);
+
     InitializeDevice();
     CreateComputePipeline();
-    CreateResources();
+    CreateResources(&transformer);
     CreateSyncObjects();
-    CreateUploadAndReadBackBuffers();
+    CreateUploadAndReadBackBuffers(&transformer);
 
     // Prepare test data
     std::vector<float> matrixA(MATRIX_ELEMENTS, 1.0f);  // Example data
     std::vector<float> matrixB(MATRIX_ELEMENTS, 2.0f);  // Example data
 
     // Execute computation
-    UploadMatrixData(matrixA, matrixB);
+    UploadMatrixData(matrixA, matrixB, &transformer);
     ExecuteCompute();
     std::vector<float> result = ReadBackResult();
     // Clean up resources
