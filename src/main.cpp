@@ -70,6 +70,17 @@ typedef struct {
     ComPtr<ID3D12Resource> rms_final_weight; // (dim,)
     // (optional) classifier weights for the logits, on the last layer
     ComPtr<ID3D12Resource> wcls;
+    ComPtr<ID3D12Resource> token_embedding_table_upload;
+    ComPtr<ID3D12Resource> rms_ffn_weight_upload;
+    ComPtr<ID3D12Resource> wq_upload;
+    ComPtr<ID3D12Resource> wk_upload;
+    ComPtr<ID3D12Resource> wv_upload;
+    ComPtr<ID3D12Resource> wo_upload;
+    ComPtr<ID3D12Resource> w1_upload;
+    ComPtr<ID3D12Resource> w2_upload;
+    ComPtr<ID3D12Resource> w3_upload;
+    ComPtr<ID3D12Resource> rms_final_weight_upload;
+    ComPtr<ID3D12Resource> wcls_upload;
 } TransformerWeightsGPU;
 
 typedef struct {
@@ -267,7 +278,7 @@ void InitializeDevice() {
 void CreateComputePipeline() {
     // Create CBV/SRV/UAV descriptor heap
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-    heapDesc.NumDescriptors = 3; // 3 UAVs
+    heapDesc.NumDescriptors = 3 + 12; // 3 UAVs for matrixABuffer, matrixBBuffer, resultBuffer, and 12 for weights
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&computeHeap));
@@ -276,9 +287,11 @@ void CreateComputePipeline() {
 
     // Create root signature
     CD3DX12_ROOT_PARAMETER rootParameter;
-    CD3DX12_DESCRIPTOR_RANGE ranges[1];
-    ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 12 + 12, 0); // 12SRV, 12 UAVs, starting register 0
-    rootParameter.InitAsDescriptorTable(1, ranges);
+    CD3DX12_DESCRIPTOR_RANGE ranges[2];
+    ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 0);
+	ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 12, 0,0, 3);//12 srv for weights
+	// 12SRV, 12 UAVs, starting register 0
+    rootParameter.InitAsDescriptorTable(2, ranges);
 
     CD3DX12_ROOT_SIGNATURE_DESC rootSignatureDesc;
     rootSignatureDesc.Init(1, &rootParameter, 0, nullptr, 
@@ -391,19 +404,37 @@ void CreateResources(Transformer* transformer) {
         IID_PPV_ARGS(&resultBuffer)
     );
 
-    auto TransformerDesc = CD3DX12_RESOURCE_DESC::Buffer(
-        transformer->weights.rms_att_weight_size * sizeof(float),
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
-    );
-    device->CreateCommittedResource(
-        &heapProperties,
-        D3D12_HEAP_FLAG_NONE,
-        &TransformerDesc,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        nullptr,
-        IID_PPV_ARGS(&transformer->weights_gpu.rms_att_weight)
-    );
+    // 为每个权重创建资源
+    auto CreateWeightResource = [&](size_t size, ComPtr<ID3D12Resource>& resource) {
+        auto desc = CD3DX12_RESOURCE_DESC::Buffer(
+            size * sizeof(float),
+            D3D12_RESOURCE_FLAG_NONE
+        );
+        device->CreateCommittedResource(
+            &heapProperties,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+            nullptr,
+            IID_PPV_ARGS(&resource)
+        );
+    };
 
+    // 创建所有权重资源
+    CreateWeightResource(transformer->weights.token_embedding_table_size, transformer->weights_gpu.token_embedding_table);
+    CreateWeightResource(transformer->weights.rms_att_weight_size, transformer->weights_gpu.rms_att_weight);
+    CreateWeightResource(transformer->weights.rms_ffn_weight_size, transformer->weights_gpu.rms_ffn_weight);
+    CreateWeightResource(transformer->weights.wq_size, transformer->weights_gpu.wq);
+    CreateWeightResource(transformer->weights.wk_size, transformer->weights_gpu.wk);
+    CreateWeightResource(transformer->weights.wv_size, transformer->weights_gpu.wv);
+    CreateWeightResource(transformer->weights.wo_size, transformer->weights_gpu.wo);
+    CreateWeightResource(transformer->weights.w1_size, transformer->weights_gpu.w1);
+    CreateWeightResource(transformer->weights.w2_size, transformer->weights_gpu.w2);
+    CreateWeightResource(transformer->weights.w3_size, transformer->weights_gpu.w3);
+    CreateWeightResource(transformer->weights.rms_final_weight_size, transformer->weights_gpu.rms_final_weight);
+    if (!(transformer->config.vocab_size > 0 ? 1 : 0)) {
+        CreateWeightResource(transformer->weights.wcls_size, transformer->weights_gpu.wcls);
+    }
 
     // Create UAV descriptors
     D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
@@ -418,24 +449,41 @@ void CreateResources(Transformer* transformer) {
     CD3DX12_CPU_DESCRIPTOR_HANDLE handle(computeHeap->GetCPUDescriptorHandleForHeapStart());
     
     device->CreateUnorderedAccessView(matrixABuffer.Get(), nullptr, &uavDesc, handle);
-
-
-
-
-    D3D12_UNORDERED_ACCESS_VIEW_DESC transformerUavDesc = {};
-    transformerUavDesc.Format = DXGI_FORMAT_UNKNOWN;
-    transformerUavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-    transformerUavDesc.Buffer.FirstElement = 0;
-    transformerUavDesc.Buffer.NumElements = transformer->weights.rms_att_weight_size;
-    transformerUavDesc.Buffer.StructureByteStride = sizeof(float);
-    transformerUavDesc.Buffer.CounterOffsetInBytes = 0;
-    transformerUavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
-
     handle.Offset(descriptorSize);
-    device->CreateUnorderedAccessView(transformer->weights_gpu.rms_att_weight.Get(), nullptr, &transformerUavDesc, handle);
-
+    device->CreateUnorderedAccessView(matrixBBuffer.Get(), nullptr, &uavDesc, handle);
     handle.Offset(descriptorSize);
     device->CreateUnorderedAccessView(resultBuffer.Get(), nullptr, &uavDesc, handle);
+    handle.Offset(descriptorSize);
+
+    // 创建所有权重的SRV
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Buffer.FirstElement = 0;
+    srvDesc.Buffer.StructureByteStride = sizeof(float);
+    srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+
+    auto CreateWeightSRV = [&](ComPtr<ID3D12Resource>& resource, size_t size) {
+        srvDesc.Buffer.NumElements = size;
+        device->CreateShaderResourceView(resource.Get(), &srvDesc, handle);
+        handle.Offset(descriptorSize);
+    };
+
+    CreateWeightSRV(transformer->weights_gpu.token_embedding_table, transformer->weights.token_embedding_table_size);
+    CreateWeightSRV(transformer->weights_gpu.rms_att_weight, transformer->weights.rms_att_weight_size);
+    CreateWeightSRV(transformer->weights_gpu.rms_ffn_weight, transformer->weights.rms_ffn_weight_size);
+    CreateWeightSRV(transformer->weights_gpu.wq, transformer->weights.wq_size);
+    CreateWeightSRV(transformer->weights_gpu.wk, transformer->weights.wk_size);
+    CreateWeightSRV(transformer->weights_gpu.wv, transformer->weights.wv_size);
+    CreateWeightSRV(transformer->weights_gpu.wo, transformer->weights.wo_size);
+    CreateWeightSRV(transformer->weights_gpu.w1, transformer->weights.w1_size);
+    CreateWeightSRV(transformer->weights_gpu.w2, transformer->weights.w2_size);
+    CreateWeightSRV(transformer->weights_gpu.w3, transformer->weights.w3_size);
+    CreateWeightSRV(transformer->weights_gpu.rms_final_weight, transformer->weights.rms_final_weight_size);
+    if (!(transformer->config.vocab_size > 0 ? 1 : 0)) {
+        CreateWeightSRV(transformer->weights_gpu.wcls, transformer->weights.wcls_size);
+    }
 }
 
 // Create synchronization objects
@@ -460,7 +508,7 @@ void CreateUploadAndReadBackBuffers(Transformer* transformer) {
         IID_PPV_ARGS(&uploadBufferA)
     );
 
-    auto hr = device->CreateCommittedResource(
+    device->CreateCommittedResource(
         &uploadHeapProperties,
         D3D12_HEAP_FLAG_NONE,
         &bufferDesc,
@@ -468,7 +516,6 @@ void CreateUploadAndReadBackBuffers(Transformer* transformer) {
         nullptr,
         IID_PPV_ARGS(&uploadBufferB)
     );
-    std::cout << std::to_string(hr);
 
     // Create read back buffer
     device->CreateCommittedResource(
@@ -480,16 +527,33 @@ void CreateUploadAndReadBackBuffers(Transformer* transformer) {
         IID_PPV_ARGS(&readBackBuffer)
     );
 
-    auto TransformerDesc = CD3DX12_RESOURCE_DESC::Buffer(transformer->weights.rms_att_weight_size * sizeof(float));
+    // 为每个权重创建上传缓冲区
+    auto CreateUploadBuffer = [&](size_t size, ComPtr<ID3D12Resource>& upload_buffer) {
+        auto desc = CD3DX12_RESOURCE_DESC::Buffer(size * sizeof(float));
+        device->CreateCommittedResource(
+            &uploadHeapProperties,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            IID_PPV_ARGS(&upload_buffer)
+        );
+    };
 
-    device->CreateCommittedResource(
-        &uploadHeapProperties,
-        D3D12_HEAP_FLAG_NONE,
-        &TransformerDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ,
-        nullptr,
-        IID_PPV_ARGS(&transformer->weights_gpu.rms_att_weight_upload)
-    );
+    CreateUploadBuffer(transformer->weights.token_embedding_table_size, transformer->weights_gpu.token_embedding_table_upload);
+    CreateUploadBuffer(transformer->weights.rms_att_weight_size, transformer->weights_gpu.rms_att_weight_upload);
+    CreateUploadBuffer(transformer->weights.rms_ffn_weight_size, transformer->weights_gpu.rms_ffn_weight_upload);
+    CreateUploadBuffer(transformer->weights.wq_size, transformer->weights_gpu.wq_upload);
+    CreateUploadBuffer(transformer->weights.wk_size, transformer->weights_gpu.wk_upload);
+    CreateUploadBuffer(transformer->weights.wv_size, transformer->weights_gpu.wv_upload);
+    CreateUploadBuffer(transformer->weights.wo_size, transformer->weights_gpu.wo_upload);
+    CreateUploadBuffer(transformer->weights.w1_size, transformer->weights_gpu.w1_upload);
+    CreateUploadBuffer(transformer->weights.w2_size, transformer->weights_gpu.w2_upload);
+    CreateUploadBuffer(transformer->weights.w3_size, transformer->weights_gpu.w3_upload);
+    CreateUploadBuffer(transformer->weights.rms_final_weight_size, transformer->weights_gpu.rms_final_weight_upload);
+    if (!(transformer->config.vocab_size > 0 ? 1 : 0)) {
+        CreateUploadBuffer(transformer->weights.wcls_size, transformer->weights_gpu.wcls_upload);
+    }
 }
 
 // Upload matrix data to GPU
@@ -504,51 +568,125 @@ void UploadMatrixData(const std::vector<float>& matrixA, const std::vector<float
     memcpy(mappedData, matrixB.data(), MATRIX_ELEMENTS * sizeof(float));
     uploadBufferB->Unmap(0, nullptr);
 
-    transformer->weights_gpu.rms_att_weight_upload->Map(0, nullptr, &mappedData);
-    memcpy(mappedData, transformer->weights.rms_att_weight, transformer->weights.rms_att_weight_size * sizeof(float));
-    transformer->weights_gpu.rms_att_weight_upload->Unmap(0, nullptr);
+    // 上传所有权重数据
+    auto UploadWeight = [](ComPtr<ID3D12Resource>& upload_buffer, float* data, size_t size) {
+        void* mappedData;
+        upload_buffer->Map(0, nullptr, &mappedData);
+        memcpy(mappedData, data, size * sizeof(float));
+        upload_buffer->Unmap(0, nullptr);
+    };
+
+    UploadWeight(transformer->weights_gpu.token_embedding_table_upload, transformer->weights.token_embedding_table, transformer->weights.token_embedding_table_size);
+    UploadWeight(transformer->weights_gpu.rms_att_weight_upload, transformer->weights.rms_att_weight, transformer->weights.rms_att_weight_size);
+    UploadWeight(transformer->weights_gpu.rms_ffn_weight_upload, transformer->weights.rms_ffn_weight, transformer->weights.rms_ffn_weight_size);
+    UploadWeight(transformer->weights_gpu.wq_upload, transformer->weights.wq, transformer->weights.wq_size);
+    UploadWeight(transformer->weights_gpu.wk_upload, transformer->weights.wk, transformer->weights.wk_size);
+    UploadWeight(transformer->weights_gpu.wv_upload, transformer->weights.wv, transformer->weights.wv_size);
+    UploadWeight(transformer->weights_gpu.wo_upload, transformer->weights.wo, transformer->weights.wo_size);
+    UploadWeight(transformer->weights_gpu.w1_upload, transformer->weights.w1, transformer->weights.w1_size);
+    UploadWeight(transformer->weights_gpu.w2_upload, transformer->weights.w2, transformer->weights.w2_size);
+    UploadWeight(transformer->weights_gpu.w3_upload, transformer->weights.w3, transformer->weights.w3_size);
+    UploadWeight(transformer->weights_gpu.rms_final_weight_upload, transformer->weights.rms_final_weight, transformer->weights.rms_final_weight_size);
+    if (!(transformer->config.vocab_size > 0 ? 1 : 0)) {
+        UploadWeight(transformer->weights_gpu.wcls_upload, transformer->weights.wcls, transformer->weights.wcls_size);
+    }
 
     // Record copy commands
     commandList->Reset(commandAllocator.Get(), nullptr);
 
-    auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-        matrixABuffer.Get(),
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_COPY_DEST
-    );
-    commandList->ResourceBarrier(1, &barrier);
+    // 添加所有资源屏障
+    std::vector<CD3DX12_RESOURCE_BARRIER> barriers;
+    auto AddBarrier = [&barriers](ComPtr<ID3D12Resource>& resource) {
+        barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
+            resource.Get(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_DEST
+        ));
+    };
 
-    barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-        matrixBBuffer.Get(),
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_COPY_DEST
-    );
-    commandList->ResourceBarrier(1, &barrier);
+    std::vector<CD3DX12_RESOURCE_BARRIER> barriers2;
+    auto AddBarrier2 = [&barriers2](ComPtr<ID3D12Resource>& resource) {
+        barriers2.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
+            resource.Get(),
+            D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST
+        ));
+        };
 
-    barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-        transformer->weights_gpu.rms_att_weight.Get(),
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_COPY_DEST
-    );
-    commandList->ResourceBarrier(1, &barrier);
+    AddBarrier(matrixABuffer);
+    AddBarrier(matrixBBuffer);
+    AddBarrier2(transformer->weights_gpu.token_embedding_table);
+    AddBarrier2(transformer->weights_gpu.rms_att_weight);
+    AddBarrier2(transformer->weights_gpu.rms_ffn_weight);
+    AddBarrier2(transformer->weights_gpu.wq);
+    AddBarrier2(transformer->weights_gpu.wk);
+    AddBarrier2(transformer->weights_gpu.wv);
+    AddBarrier2(transformer->weights_gpu.wo);
+    AddBarrier2(transformer->weights_gpu.w1);
+    AddBarrier2(transformer->weights_gpu.w2);
+    AddBarrier2(transformer->weights_gpu.w3);
+    AddBarrier2(transformer->weights_gpu.rms_final_weight);
+    if (!(transformer->config.vocab_size > 0 ? 1 : 0)) {
+        AddBarrier2(transformer->weights_gpu.wcls);
+    }
 
+    commandList->ResourceBarrier(barriers.size(), barriers.data());
+
+    // 执行所有复制操作
     commandList->CopyResource(matrixABuffer.Get(), uploadBufferA.Get());
     commandList->CopyResource(matrixBBuffer.Get(), uploadBufferB.Get());
+    commandList->CopyResource(transformer->weights_gpu.token_embedding_table.Get(), transformer->weights_gpu.token_embedding_table_upload.Get());
     commandList->CopyResource(transformer->weights_gpu.rms_att_weight.Get(), transformer->weights_gpu.rms_att_weight_upload.Get());
+    commandList->CopyResource(transformer->weights_gpu.rms_ffn_weight.Get(), transformer->weights_gpu.rms_ffn_weight_upload.Get());
+    commandList->CopyResource(transformer->weights_gpu.wq.Get(), transformer->weights_gpu.wq_upload.Get());
+    commandList->CopyResource(transformer->weights_gpu.wk.Get(), transformer->weights_gpu.wk_upload.Get());
+    commandList->CopyResource(transformer->weights_gpu.wv.Get(), transformer->weights_gpu.wv_upload.Get());
+    commandList->CopyResource(transformer->weights_gpu.wo.Get(), transformer->weights_gpu.wo_upload.Get());
+    commandList->CopyResource(transformer->weights_gpu.w1.Get(), transformer->weights_gpu.w1_upload.Get());
+    commandList->CopyResource(transformer->weights_gpu.w2.Get(), transformer->weights_gpu.w2_upload.Get());
+    commandList->CopyResource(transformer->weights_gpu.w3.Get(), transformer->weights_gpu.w3_upload.Get());
+    commandList->CopyResource(transformer->weights_gpu.rms_final_weight.Get(), transformer->weights_gpu.rms_final_weight_upload.Get());
+    if (!(transformer->config.vocab_size > 0 ? 1 : 0)) {
+        commandList->CopyResource(transformer->weights_gpu.wcls.Get(), transformer->weights_gpu.wcls_upload.Get());
+    }
 
-    barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-        matrixABuffer.Get(),
-        D3D12_RESOURCE_STATE_COPY_DEST,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-    );
-    commandList->ResourceBarrier(1, &barrier);
+    // 创建新的资源屏障数组用于转换回 UAV 状态
+    std::vector<CD3DX12_RESOURCE_BARRIER> uavBarriers;
+    auto AddUAVBarrier = [&uavBarriers](ComPtr<ID3D12Resource>& resource) {
+        uavBarriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
+            resource.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        ));
+    };
 
-    barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-        matrixBBuffer.Get(),
-        D3D12_RESOURCE_STATE_COPY_DEST,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-    );
-    commandList->ResourceBarrier(1, &barrier);
+    std::vector<CD3DX12_RESOURCE_BARRIER> srvBarriers;
+    auto AddSRVBarrier = [&srvBarriers](ComPtr<ID3D12Resource>& resource) {
+        srvBarriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
+            resource.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE
+        ));
+        };
+
+    AddUAVBarrier(matrixABuffer);
+    AddUAVBarrier(matrixBBuffer);
+    AddSRVBarrier(transformer->weights_gpu.token_embedding_table);
+    AddSRVBarrier(transformer->weights_gpu.rms_att_weight);
+    AddSRVBarrier(transformer->weights_gpu.rms_ffn_weight);
+    AddSRVBarrier(transformer->weights_gpu.wq);
+    AddSRVBarrier(transformer->weights_gpu.wk);
+    AddSRVBarrier(transformer->weights_gpu.wv);
+    AddSRVBarrier(transformer->weights_gpu.wo);
+    AddSRVBarrier(transformer->weights_gpu.w1);
+    AddSRVBarrier(transformer->weights_gpu.w2);
+    AddSRVBarrier(transformer->weights_gpu.w3);
+    AddSRVBarrier(transformer->weights_gpu.rms_final_weight);
+    if (!(transformer->config.vocab_size > 0 ? 1 : 0)) {
+        AddSRVBarrier(transformer->weights_gpu.wcls);
+    }
+
+    commandList->ResourceBarrier(uavBarriers.size(), uavBarriers.data());
 
     commandList->Close();
     
