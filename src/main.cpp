@@ -17,11 +17,6 @@
 
 using namespace Microsoft::WRL;
 
-// Constants definition
-const int MATRIX_WIDTH = 8192;
-const int MATRIX_HEIGHT = 8192;
-const UINT MATRIX_ELEMENTS = MATRIX_WIDTH * MATRIX_HEIGHT;
-
 // DX12 related variables
 ComPtr<ID3D12Device> device;
 ComPtr<ID3D12CommandQueue> commandQueue;
@@ -30,20 +25,11 @@ ComPtr<ID3D12GraphicsCommandList> commandList;
 ComPtr<ID3D12RootSignature> rootSignature;
 ComPtr<ID3D12PipelineState> pipelineState;
 
-// Resource related
-ComPtr<ID3D12Resource> matrixABuffer;
-ComPtr<ID3D12Resource> matrixBBuffer;
-ComPtr<ID3D12Resource> resultBuffer;
 
 // Synchronization related variables
 ComPtr<ID3D12Fence> fence;
 UINT64 fenceValue = 0;
 HANDLE fenceEvent;
-
-// Upload heap buffers
-ComPtr<ID3D12Resource> uploadBufferA;
-ComPtr<ID3D12Resource> uploadBufferB;
-ComPtr<ID3D12Resource> readBackBuffer;
 
 // Add in global variable area ...
 ComPtr<ID3D12DescriptorHeap> computeHeap;
@@ -128,9 +114,42 @@ typedef struct {
 } Config;
 
 typedef struct {
+    // current wave of activations
+    ComPtr<ID3D12Resource> x;          // activation at current time stamp (dim,)
+    size_t x_size;                     // dim
+    ComPtr<ID3D12Resource> xb;         // same, but inside a residual branch (dim,)
+    size_t xb_size;                    // dim
+    ComPtr<ID3D12Resource> xb2;        // additional buffer for convenience (dim,)
+    size_t xb2_size;                   // dim
+    ComPtr<ID3D12Resource> hb;         // buffer for hidden dimension in the ffn (hidden_dim,)
+    size_t hb_size;                    // hidden_dim
+    ComPtr<ID3D12Resource> hb2;        // buffer for hidden dimension in the ffn (hidden_dim,)
+    size_t hb2_size;                   // hidden_dim
+    ComPtr<ID3D12Resource> q;          // query (dim,)
+    size_t q_size;                     // dim
+    ComPtr<ID3D12Resource> k;          // key (dim,)
+    size_t k_size;                     // dim
+    ComPtr<ID3D12Resource> v;          // value (dim,)
+    size_t v_size;                     // dim
+    ComPtr<ID3D12Resource> att;        // buffer for scores/attention values (n_heads, seq_len)
+    size_t att_size;                   // n_heads * seq_len
+    ComPtr<ID3D12Resource> logits;     // output logits (vocab_size,)
+    ComPtr<ID3D12Resource> logits_readback;
+    size_t logits_size;                // vocab_size
+
+    // kv cache
+    ComPtr<ID3D12Resource> key_cache;   // (layer, seq_len, dim)
+    size_t key_cache_size;              // n_layers * seq_len * dim
+    ComPtr<ID3D12Resource> value_cache; // (layer, seq_len, dim)
+    size_t value_cache_size;            // n_layers * seq_len * dim
+} RunStateGPU;
+
+
+typedef struct {
     Config config;
     TransformerWeights weights;
     TransformerWeightsGPU weights_gpu;
+    RunStateGPU runstate_gpu;
     // Windows特定的句柄
     HANDLE file_handle;
     float* data;
@@ -195,7 +214,7 @@ ComPtr<IDXCoreAdapter1> GetAdapter() {
                 (SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::DriverDescription, description)));
                 std::cout << i + 1 << ". " << description << std::endl;
 
-                // 获取显存信息
+                // 获取显存���息
                 uint64_t dedicatedMemory = 0;
                 if (SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::DedicatedAdapterMemory,
                     &dedicatedMemory))) {
@@ -278,7 +297,7 @@ void InitializeDevice() {
 void CreateComputePipeline() {
     // Create CBV/SRV/UAV descriptor heap
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-    heapDesc.NumDescriptors = 3 + 12; // 3 UAVs for matrixABuffer, matrixBBuffer, resultBuffer, and 12 for weights
+    heapDesc.NumDescriptors = 12 + 12; // 12 UAVs for run state, and 12 for weights
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&computeHeap));
@@ -288,8 +307,8 @@ void CreateComputePipeline() {
     // Create root signature
     CD3DX12_ROOT_PARAMETER rootParameter;
     CD3DX12_DESCRIPTOR_RANGE ranges[2];
-    ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 0);
-	ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 12, 0,0, 3);//12 srv for weights
+    ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 12, 0, 0, 0);//12 uav for runstate
+	ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 12, 0,0,12);//12 srv for weights
 	// 12SRV, 12 UAVs, starting register 0
     rootParameter.InitAsDescriptorTable(2, ranges);
 
@@ -367,42 +386,102 @@ void CreateComputePipeline() {
     device->CreateComputePipelineState(&computePsoDesc, IID_PPV_ARGS(&pipelineState));
 }
 
+void create_run_state_gpu(RunStateGPU* s, Config* p, ID3D12Device* device, ID3D12DescriptorHeap* uavHeap, CD3DX12_CPU_DESCRIPTOR_HANDLE& handle) {
+    // 计算kv_dim
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+
+    // 设置所有buffer的大小
+    s->x_size = p->dim;
+    s->xb_size = p->dim;
+    s->xb2_size = p->dim;
+    s->hb_size = p->hidden_dim;
+    s->hb2_size = p->hidden_dim;
+    s->q_size = p->dim;
+    s->k_size = p->dim;
+    s->v_size = p->dim;
+    s->att_size = p->n_heads * p->seq_len;
+    s->logits_size = p->vocab_size;
+    s->key_cache_size = p->n_layers * p->seq_len * kv_dim;
+    s->value_cache_size = p->n_layers * p->seq_len * kv_dim;
+
+    // 创建默认堆属性(GPU内存)
+    auto heapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+
+    // 创建资源的lambda函数
+    auto CreateBuffer = [&](size_t numElements, ComPtr<ID3D12Resource>& resource) {
+        auto desc = CD3DX12_RESOURCE_DESC::Buffer(
+            numElements * sizeof(float),
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS  // 允许UAV访问
+        );
+
+        if (FAILED(device->CreateCommittedResource(
+            &heapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,  // 初始状态设为UAV
+            nullptr,
+            IID_PPV_ARGS(&resource)))) {
+            throw std::runtime_error("Failed to create buffer resource");
+        }
+    };
+
+    // 创建所有缓冲区
+    CreateBuffer(s->x_size, s->x);
+    CreateBuffer(s->xb_size, s->xb);
+    CreateBuffer(s->xb2_size, s->xb2);
+    CreateBuffer(s->hb_size, s->hb);
+    CreateBuffer(s->hb2_size, s->hb2);
+    CreateBuffer(s->q_size, s->q);
+    CreateBuffer(s->k_size, s->k);
+    CreateBuffer(s->v_size, s->v);
+    CreateBuffer(s->att_size, s->att);
+    CreateBuffer(s->logits_size, s->logits);
+    CreateBuffer(s->key_cache_size, s->key_cache);
+    CreateBuffer(s->value_cache_size, s->value_cache);
+
+    // 获取UAV描述符的大小
+    UINT descriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    // 创建UAV的lambda函数
+    auto CreateUAV = [&](ID3D12Resource* resource, size_t numElements, CD3DX12_CPU_DESCRIPTOR_HANDLE& handle) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+        uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
+        uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uavDesc.Buffer.FirstElement = 0;
+        uavDesc.Buffer.NumElements = numElements;
+        uavDesc.Buffer.StructureByteStride = 0;
+        uavDesc.Buffer.CounterOffsetInBytes = 0;
+        uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+
+        device->CreateUnorderedAccessView(
+            resource,
+            nullptr,
+            &uavDesc,
+            handle);
+
+        handle.Offset(descriptorSize);
+        };
+
+    // 创建所有UAV    
+    CreateUAV(s->x.Get(), p->dim, handle);
+    CreateUAV(s->xb.Get(), p->dim, handle);
+    CreateUAV(s->xb2.Get(), p->dim, handle);
+    CreateUAV(s->hb.Get(), p->hidden_dim, handle);
+    CreateUAV(s->hb2.Get(), p->hidden_dim, handle);
+    CreateUAV(s->q.Get(), p->dim, handle);
+    CreateUAV(s->k.Get(), p->dim, handle);
+    CreateUAV(s->v.Get(), p->dim, handle);
+    CreateUAV(s->att.Get(), p->n_heads * p->seq_len, handle);
+    CreateUAV(s->logits.Get(), p->vocab_size, handle);
+    CreateUAV(s->key_cache.Get(), p->n_layers * p->seq_len * kv_dim, handle);
+    CreateUAV(s->value_cache.Get(), p->n_layers * p->seq_len * kv_dim, handle);
+}
 
 // Create resource buffers
 void CreateResources(Transformer* transformer) {
     // Create matrix buffers
     auto heapProperties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
-    auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(
-        MATRIX_ELEMENTS * sizeof(float),
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
-    );
 
-    device->CreateCommittedResource(
-        &heapProperties,
-        D3D12_HEAP_FLAG_NONE,
-        &resourceDesc,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        nullptr,
-        IID_PPV_ARGS(&matrixABuffer)
-    );
-
-    device->CreateCommittedResource(
-        &heapProperties,
-        D3D12_HEAP_FLAG_NONE,
-        &resourceDesc,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        nullptr,
-        IID_PPV_ARGS(&matrixBBuffer)
-    );
-
-    device->CreateCommittedResource(
-        &heapProperties,
-        D3D12_HEAP_FLAG_NONE,
-        &resourceDesc,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        nullptr,
-        IID_PPV_ARGS(&resultBuffer)
-    );
 
     // 为每个权重创建资源
     auto CreateWeightResource = [&](size_t size, ComPtr<ID3D12Resource>& resource) {
@@ -436,24 +515,11 @@ void CreateResources(Transformer* transformer) {
         CreateWeightResource(transformer->weights.wcls_size, transformer->weights_gpu.wcls);
     }
 
-    // Create UAV descriptors
-    D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
-    uavDesc.Format = DXGI_FORMAT_UNKNOWN;
-    uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-    uavDesc.Buffer.FirstElement = 0;
-    uavDesc.Buffer.NumElements = MATRIX_ELEMENTS;
-    uavDesc.Buffer.StructureByteStride = sizeof(float);
-    uavDesc.Buffer.CounterOffsetInBytes = 0;
-    uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+
 
     CD3DX12_CPU_DESCRIPTOR_HANDLE handle(computeHeap->GetCPUDescriptorHandleForHeapStart());
-    
-    device->CreateUnorderedAccessView(matrixABuffer.Get(), nullptr, &uavDesc, handle);
-    handle.Offset(descriptorSize);
-    device->CreateUnorderedAccessView(matrixBBuffer.Get(), nullptr, &uavDesc, handle);
-    handle.Offset(descriptorSize);
-    device->CreateUnorderedAccessView(resultBuffer.Get(), nullptr, &uavDesc, handle);
-    handle.Offset(descriptorSize);
+
+    create_run_state_gpu(&transformer->runstate_gpu, &transformer->config, device.Get(), computeHeap.Get(), handle);
 
     // 创建所有权重的SRV
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
@@ -484,6 +550,7 @@ void CreateResources(Transformer* transformer) {
     if (!(transformer->config.vocab_size > 0 ? 1 : 0)) {
         CreateWeightSRV(transformer->weights_gpu.wcls, transformer->weights.wcls_size);
     }
+
 }
 
 // Create synchronization objects
@@ -496,35 +563,17 @@ void CreateSyncObjects() {
 void CreateUploadAndReadBackBuffers(Transformer* transformer) {
     auto uploadHeapProperties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
     auto readbackHeapProperties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
-    auto bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(MATRIX_ELEMENTS * sizeof(float));
 
-    // Create upload buffer
-    device->CreateCommittedResource(
-        &uploadHeapProperties,
-        D3D12_HEAP_FLAG_NONE,
-        &bufferDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ,
-        nullptr,
-        IID_PPV_ARGS(&uploadBufferA)
+    auto readbackDesc = CD3DX12_RESOURCE_DESC::Buffer(
+        transformer->runstate_gpu.logits_size // logits 大小为词汇表大小
     );
-
-    device->CreateCommittedResource(
-        &uploadHeapProperties,
-        D3D12_HEAP_FLAG_NONE,
-        &bufferDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ,
-        nullptr,
-        IID_PPV_ARGS(&uploadBufferB)
-    );
-
-    // Create read back buffer
     device->CreateCommittedResource(
         &readbackHeapProperties,
         D3D12_HEAP_FLAG_NONE,
-        &bufferDesc,
+        &readbackDesc,
         D3D12_RESOURCE_STATE_COPY_DEST,
         nullptr,
-        IID_PPV_ARGS(&readBackBuffer)
+        IID_PPV_ARGS(&transformer->runstate_gpu.logits_readback)
     );
 
     // 为每个权重创建上传缓冲区
@@ -557,16 +606,8 @@ void CreateUploadAndReadBackBuffers(Transformer* transformer) {
 }
 
 // Upload matrix data to GPU
-void UploadMatrixData(const std::vector<float>& matrixA, const std::vector<float>& matrixB, Transformer* transformer) {
+void UploadTransformerWeights(Transformer* transformer) {
     // Map and copy data to upload buffers
-    void* mappedData;
-    uploadBufferA->Map(0, nullptr, &mappedData);
-    memcpy(mappedData, matrixA.data(), MATRIX_ELEMENTS * sizeof(float));
-    uploadBufferA->Unmap(0, nullptr);
-
-    uploadBufferB->Map(0, nullptr, &mappedData);
-    memcpy(mappedData, matrixB.data(), MATRIX_ELEMENTS * sizeof(float));
-    uploadBufferB->Unmap(0, nullptr);
 
     // 上传所有权重数据
     auto UploadWeight = [](ComPtr<ID3D12Resource>& upload_buffer, float* data, size_t size) {
@@ -613,8 +654,6 @@ void UploadMatrixData(const std::vector<float>& matrixA, const std::vector<float
         ));
         };
 
-    AddBarrier(matrixABuffer);
-    AddBarrier(matrixBBuffer);
     AddBarrier2(transformer->weights_gpu.token_embedding_table);
     AddBarrier2(transformer->weights_gpu.rms_att_weight);
     AddBarrier2(transformer->weights_gpu.rms_ffn_weight);
@@ -633,8 +672,6 @@ void UploadMatrixData(const std::vector<float>& matrixA, const std::vector<float
     commandList->ResourceBarrier(barriers.size(), barriers.data());
 
     // 执行所有复制操作
-    commandList->CopyResource(matrixABuffer.Get(), uploadBufferA.Get());
-    commandList->CopyResource(matrixBBuffer.Get(), uploadBufferB.Get());
     commandList->CopyResource(transformer->weights_gpu.token_embedding_table.Get(), transformer->weights_gpu.token_embedding_table_upload.Get());
     commandList->CopyResource(transformer->weights_gpu.rms_att_weight.Get(), transformer->weights_gpu.rms_att_weight_upload.Get());
     commandList->CopyResource(transformer->weights_gpu.rms_ffn_weight.Get(), transformer->weights_gpu.rms_ffn_weight_upload.Get());
@@ -669,8 +706,6 @@ void UploadMatrixData(const std::vector<float>& matrixA, const std::vector<float
         ));
         };
 
-    AddUAVBarrier(matrixABuffer);
-    AddUAVBarrier(matrixBBuffer);
     AddSRVBarrier(transformer->weights_gpu.token_embedding_table);
     AddSRVBarrier(transformer->weights_gpu.rms_att_weight);
     AddSRVBarrier(transformer->weights_gpu.rms_ffn_weight);
@@ -698,8 +733,8 @@ void UploadMatrixData(const std::vector<float>& matrixA, const std::vector<float
     WaitForGpu();
 }
 
-// Execute compute shader
-void ExecuteCompute() {
+// Execute compute shader 
+void ExecuteCompute(Transformer* transformer) {
     commandList->Reset(commandAllocator.Get(), pipelineState.Get());
     
     // Set descriptor heaps
@@ -711,18 +746,18 @@ void ExecuteCompute() {
     commandList->SetComputeRootDescriptorTable(0, computeHeap->GetGPUDescriptorHandleForHeapStart());
 
     // Dispatch compute shader
-    commandList->Dispatch(MATRIX_WIDTH / 32, MATRIX_HEIGHT / 32, 1);
+    commandList->Dispatch(int(transformer->runstate_gpu.logits_size / 32), 1, 1);
 
     // Add barrier to ensure computation is complete
     auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-        resultBuffer.Get(),
+        transformer->runstate_gpu.logits.Get(),
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_COPY_SOURCE
     );
     commandList->ResourceBarrier(1, &barrier);
 
     // Copy result to read back buffer
-    commandList->CopyResource(readBackBuffer.Get(), resultBuffer.Get());
+    commandList->CopyResource(transformer->runstate_gpu.logits_readback.Get(), transformer->runstate_gpu.logits.Get());
 
     commandList->Close();
 
@@ -734,12 +769,12 @@ void ExecuteCompute() {
     WaitForGpu();
 }
 // Read back computation result
-std::vector<float> ReadBackResult() {
-    std::vector<float> result(MATRIX_ELEMENTS);
+std::vector<float> ReadBackResult(Transformer* transformer) {
+    std::vector<float> result(transformer->runstate_gpu.logits_size);
     void* mappedData;
-    readBackBuffer->Map(0, nullptr, &mappedData);
-    memcpy(result.data(), mappedData, MATRIX_ELEMENTS * sizeof(float));
-    readBackBuffer->Unmap(0, nullptr);
+    transformer->runstate_gpu.logits_readback->Map(0, nullptr, &mappedData);
+    memcpy(result.data(), mappedData, transformer->runstate_gpu.logits_size * sizeof(float));
+    transformer->runstate_gpu.logits_readback->Unmap(0, nullptr);
     return result;
 }
 
@@ -908,14 +943,11 @@ int main(int argc, char* argv[]) {
     CreateSyncObjects();
     CreateUploadAndReadBackBuffers(&transformer);
 
-    // Prepare test data
-    std::vector<float> matrixA(MATRIX_ELEMENTS, 1.0f);  // Example data
-    std::vector<float> matrixB(MATRIX_ELEMENTS, 2.0f);  // Example data
 
     // Execute computation
-    UploadMatrixData(matrixA, matrixB, &transformer);
-    ExecuteCompute();
-    std::vector<float> result = ReadBackResult();
+    UploadTransformerWeights(&transformer);
+    ExecuteCompute(&transformer);
+    std::vector<float> result = ReadBackResult(&transformer);
     // Clean up resources
     CloseHandle(fenceEvent);
     return 0;
