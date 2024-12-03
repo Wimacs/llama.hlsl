@@ -190,7 +190,7 @@ bool TryGetProperty(IDXCoreAdapter* adapter, DXCoreAdapterProperty prop, std::st
     return false;
 }
 
-ComPtr<IDXCoreAdapter1> GetAdapter() {
+ComPtr<IDXCoreAdapter> GetAdapter() {
     ComPtr<IDXCoreAdapterFactory> factory;
     if (FAILED(DXCoreCreateAdapterFactory(IID_PPV_ARGS(&factory)))) {
         throw std::runtime_error("Failed to create DXCore factory");
@@ -202,11 +202,11 @@ ComPtr<IDXCoreAdapter1> GetAdapter() {
         throw std::runtime_error("Failed to create adapter list");
     }
 
-    std::vector<ComPtr<IDXCoreAdapter1>> dxCoreAdapters;
+    std::vector<ComPtr<IDXCoreAdapter>> dxCoreAdapters;
     uint32_t adapterCount = adapterList->GetAdapterCount();
     
     for (uint32_t i = 0; i < adapterCount; ++i) {
-        ComPtr<IDXCoreAdapter1> adapter;
+        ComPtr<IDXCoreAdapter> adapter;
         if (SUCCEEDED(adapterList->GetAdapter(i, IID_PPV_ARGS(&adapter)))) {
             bool isHardware = false;
         	{
@@ -565,7 +565,7 @@ void CreateUploadAndReadBackBuffers(Transformer* transformer) {
     auto readbackHeapProperties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
 
     auto readbackDesc = CD3DX12_RESOURCE_DESC::Buffer(
-        transformer->runstate_gpu.logits_size // logits 大小为词汇表大小
+        transformer->runstate_gpu.logits_size * sizeof(float) // logits 大小为词汇表大小
     );
     device->CreateCommittedResource(
         &readbackHeapProperties,
