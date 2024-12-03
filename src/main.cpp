@@ -150,7 +150,7 @@ typedef struct {
     TransformerWeights weights;
     TransformerWeightsGPU weights_gpu;
     RunStateGPU runstate_gpu;
-    // Windows特定的句柄
+    // Windows specific handle
     HANDLE file_handle;
     float* data;
     size_t file_size;
@@ -214,7 +214,7 @@ ComPtr<IDXCoreAdapter> GetAdapter() {
                 (SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::DriverDescription, description)));
                 std::cout << i + 1 << ". " << description << std::endl;
 
-                // 获取显存���息
+                // Get memory information
                 uint64_t dedicatedMemory = 0;
                 if (SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::DedicatedAdapterMemory,
                     &dedicatedMemory))) {
@@ -387,10 +387,10 @@ void CreateComputePipeline() {
 }
 
 void create_run_state_gpu(RunStateGPU* s, Config* p, ID3D12Device* device, ID3D12DescriptorHeap* uavHeap, CD3DX12_CPU_DESCRIPTOR_HANDLE& handle) {
-    // 计算kv_dim
+    // Calculate kv_dim
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
 
-    // 设置所有buffer的大小
+    // Set all buffer sizes
     s->x_size = p->dim;
     s->xb_size = p->dim;
     s->xb2_size = p->dim;
@@ -404,28 +404,28 @@ void create_run_state_gpu(RunStateGPU* s, Config* p, ID3D12Device* device, ID3D1
     s->key_cache_size = p->n_layers * p->seq_len * kv_dim;
     s->value_cache_size = p->n_layers * p->seq_len * kv_dim;
 
-    // 创建默认堆属性(GPU内存)
+    // Create default heap properties (GPU memory)
     auto heapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
 
-    // 创建资源的lambda函数
+    // Create buffer lambda function
     auto CreateBuffer = [&](size_t numElements, ComPtr<ID3D12Resource>& resource) {
         auto desc = CD3DX12_RESOURCE_DESC::Buffer(
             numElements * sizeof(float),
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS  // 允许UAV访问
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS  // Allow UAV access
         );
 
         if (FAILED(device->CreateCommittedResource(
             &heapProps,
             D3D12_HEAP_FLAG_NONE,
             &desc,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,  // 初始状态设为UAV
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,  // Initial state set to UAV
             nullptr,
             IID_PPV_ARGS(&resource)))) {
             throw std::runtime_error("Failed to create buffer resource");
         }
     };
 
-    // 创建所有缓冲区
+    // Create all buffers
     CreateBuffer(s->x_size, s->x);
     CreateBuffer(s->xb_size, s->xb);
     CreateBuffer(s->xb2_size, s->xb2);
@@ -439,10 +439,10 @@ void create_run_state_gpu(RunStateGPU* s, Config* p, ID3D12Device* device, ID3D1
     CreateBuffer(s->key_cache_size, s->key_cache);
     CreateBuffer(s->value_cache_size, s->value_cache);
 
-    // 获取UAV描述符的大小
+    // Get UAV descriptor size
     UINT descriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-    // 创建UAV的lambda函数
+    // Create UAV lambda function
     auto CreateUAV = [&](ID3D12Resource* resource, size_t numElements, CD3DX12_CPU_DESCRIPTOR_HANDLE& handle) {
         D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
         uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
@@ -462,7 +462,7 @@ void create_run_state_gpu(RunStateGPU* s, Config* p, ID3D12Device* device, ID3D1
         handle.Offset(descriptorSize);
         };
 
-    // 创建所有UAV    
+    // Create all UAVs    
     CreateUAV(s->x.Get(), p->dim, handle);
     CreateUAV(s->xb.Get(), p->dim, handle);
     CreateUAV(s->xb2.Get(), p->dim, handle);
@@ -483,7 +483,7 @@ void CreateResources(Transformer* transformer) {
     auto heapProperties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
 
 
-    // 为每个权重创建资源
+    // Create resources for each weight
     auto CreateWeightResource = [&](size_t size, ComPtr<ID3D12Resource>& resource) {
         auto desc = CD3DX12_RESOURCE_DESC::Buffer(
             size * sizeof(float),
@@ -499,7 +499,7 @@ void CreateResources(Transformer* transformer) {
         );
     };
 
-    // 创建所有权重资源
+    // Create all weight resources
     CreateWeightResource(transformer->weights.token_embedding_table_size, transformer->weights_gpu.token_embedding_table);
     CreateWeightResource(transformer->weights.rms_att_weight_size, transformer->weights_gpu.rms_att_weight);
     CreateWeightResource(transformer->weights.rms_ffn_weight_size, transformer->weights_gpu.rms_ffn_weight);
@@ -521,7 +521,7 @@ void CreateResources(Transformer* transformer) {
 
     create_run_state_gpu(&transformer->runstate_gpu, &transformer->config, device.Get(), computeHeap.Get(), handle);
 
-    // 创建所有权重的SRV
+    // Create all weight SRVs
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
     srvDesc.Format = DXGI_FORMAT_UNKNOWN;
     srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
@@ -565,7 +565,7 @@ void CreateUploadAndReadBackBuffers(Transformer* transformer) {
     auto readbackHeapProperties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
 
     auto readbackDesc = CD3DX12_RESOURCE_DESC::Buffer(
-        transformer->runstate_gpu.logits_size * sizeof(float) // logits 大小为词汇表大小
+        transformer->runstate_gpu.logits_size * sizeof(float) // logits size is vocabulary size
     );
     device->CreateCommittedResource(
         &readbackHeapProperties,
@@ -576,7 +576,7 @@ void CreateUploadAndReadBackBuffers(Transformer* transformer) {
         IID_PPV_ARGS(&transformer->runstate_gpu.logits_readback)
     );
 
-    // 为每个权重创建上传缓冲区
+    // Create upload buffers for each weight
     auto CreateUploadBuffer = [&](size_t size, ComPtr<ID3D12Resource>& upload_buffer) {
         auto desc = CD3DX12_RESOURCE_DESC::Buffer(size * sizeof(float));
         device->CreateCommittedResource(
@@ -609,7 +609,7 @@ void CreateUploadAndReadBackBuffers(Transformer* transformer) {
 void UploadTransformerWeights(Transformer* transformer) {
     // Map and copy data to upload buffers
 
-    // 上传所有权重数据
+    // Upload all weight data
     auto UploadWeight = [](ComPtr<ID3D12Resource>& upload_buffer, float* data, size_t size) {
         void* mappedData;
         upload_buffer->Map(0, nullptr, &mappedData);
@@ -635,7 +635,7 @@ void UploadTransformerWeights(Transformer* transformer) {
     // Record copy commands
     commandList->Reset(commandAllocator.Get(), nullptr);
 
-    // 添加所有资源屏障
+    // Add all resource barriers
     std::vector<CD3DX12_RESOURCE_BARRIER> barriers;
     auto AddBarrier = [&barriers](ComPtr<ID3D12Resource>& resource) {
         barriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
@@ -671,7 +671,7 @@ void UploadTransformerWeights(Transformer* transformer) {
 
     commandList->ResourceBarrier(barriers.size(), barriers.data());
 
-    // 执行所有复制操作
+    // Execute all copy operations
     commandList->CopyResource(transformer->weights_gpu.token_embedding_table.Get(), transformer->weights_gpu.token_embedding_table_upload.Get());
     commandList->CopyResource(transformer->weights_gpu.rms_att_weight.Get(), transformer->weights_gpu.rms_att_weight_upload.Get());
     commandList->CopyResource(transformer->weights_gpu.rms_ffn_weight.Get(), transformer->weights_gpu.rms_ffn_weight_upload.Get());
@@ -687,7 +687,7 @@ void UploadTransformerWeights(Transformer* transformer) {
         commandList->CopyResource(transformer->weights_gpu.wcls.Get(), transformer->weights_gpu.wcls_upload.Get());
     }
 
-    // 创建新的资源屏障数组用于转换回 UAV 状态
+    // Create new resource barrier array for transitioning back to UAV state
     std::vector<CD3DX12_RESOURCE_BARRIER> uavBarriers;
     auto AddUAVBarrier = [&uavBarriers](ComPtr<ID3D12Resource>& resource) {
         uavBarriers.push_back(CD3DX12_RESOURCE_BARRIER::Transition(
@@ -838,12 +838,12 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     FILE* file = fopen(checkpoint, "rb");
     if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); exit(EXIT_FAILURE); }
 
-    // 读取配置信息
+    // Read configuration information
     if (fread(config, sizeof(Config), 1, file) != 1) { exit(EXIT_FAILURE); }
     int shared_weights = config->vocab_size > 0 ? 1 : 0;
     config->vocab_size = abs(config->vocab_size);
 
-    // 获取文件大小
+    // Get file size
     fseek(file, 0, SEEK_END);
     *file_size = ftell(file);
     fclose(file);
@@ -863,7 +863,7 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     }
 
     *data = (float*)MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
-    CloseHandle(mapping); // 映射视图创建后可以关闭mapping句柄
+    CloseHandle(mapping); // Can close mapping handle after creating the view
 
     if (*data == NULL) {
         CloseHandle(*file_handle);
@@ -871,7 +871,7 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
         exit(EXIT_FAILURE);
     }
 
-    // 设置权重指针
+    // Set weight pointers
     float* weights_ptr = *data + sizeof(Config) / sizeof(float);
     memory_map_weights(weights, config, weights_ptr, shared_weights);
 }
