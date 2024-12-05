@@ -23,7 +23,6 @@ ComPtr<ID3D12CommandQueue> commandQueue;
 ComPtr<ID3D12CommandAllocator> commandAllocator;
 ComPtr<ID3D12GraphicsCommandList> commandList;
 ComPtr<ID3D12RootSignature> rootSignature;
-ComPtr<ID3D12PipelineState> pipelineState;
 
 
 // Synchronization related variables
@@ -293,8 +292,16 @@ void InitializeDevice() {
     }
 }
 
-// Create compute pipeline
-void CreateComputePipeline() {
+struct TransformerPSOs {
+    ComPtr<ID3D12PipelineState> tokenEmbeddingPSO;
+    ComPtr<ID3D12PipelineState> rmsNormPSO;
+    ComPtr<ID3D12PipelineState> matMulPSO;
+    ComPtr<ID3D12PipelineState> ropePSO;
+    ComPtr<ID3D12PipelineState> multiHeadAttentionPSO;
+    // 其他 PSO 可以在这里添加
+};
+
+void CreateComputePipeline(TransformerPSOs* psos) {
     // Create CBV/SRV/UAV descriptor heap
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
     heapDesc.NumDescriptors = 12 + 12; // 12 UAVs for run state, and 12 for weights
@@ -307,9 +314,8 @@ void CreateComputePipeline() {
     // Create root signature
     CD3DX12_ROOT_PARAMETER rootParameter;
     CD3DX12_DESCRIPTOR_RANGE ranges[2];
-    ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 12, 0, 0, 0);//12 uav for runstate
-	ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 12, 0,0,12);//12 srv for weights
-	// 12SRV, 12 UAVs, starting register 0
+    ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 12, 0, 0, 0); // 12 UAVs for runstate
+    ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 12, 0, 0, 12); // 12 SRVs for weights
     rootParameter.InitAsDescriptorTable(2, ranges);
 
     CD3DX12_ROOT_SIGNATURE_DESC rootSignatureDesc;
@@ -332,58 +338,68 @@ void CreateComputePipeline() {
     DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&dxcCompiler));
     dxcUtils->CreateDefaultIncludeHandler(&dxcIncludeHandler);
 
-    // Load shader file
-    ComPtr<IDxcBlobEncoding> shaderSource;
-    dxcUtils->LoadFile(L"../src/matmul.hlsl", nullptr, &shaderSource);
+    // Lambda function to compile shader and create PSO
+    auto createPSO = [&](const std::wstring& shaderPath, ComPtr<ID3D12PipelineState>& pso) {
+        // Load shader file
+        ComPtr<IDxcBlobEncoding> shaderSource;
+        dxcUtils->LoadFile(shaderPath.c_str(), nullptr, &shaderSource);
 
-    // Set compilation parameters
-    LPCWSTR args[] = {
-        L"-E", L"CSMain",  // Entry point
-        L"-T", L"cs_6_0",  // target profile
-        L"-Zi",            // Debug information
-        L"-Od"             // Disable optimization
+        // Set compilation parameters
+        LPCWSTR args[] = {
+            L"-E", L"CSMain",  // Entry point
+            L"-T", L"cs_6_0",  // target profile
+            L"-Zi",            // Debug information
+            L"-Od"             // Disable optimization
+        };
+
+        // Create compilation parameters
+        DxcBuffer sourceBuffer;
+        sourceBuffer.Ptr = shaderSource->GetBufferPointer();
+        sourceBuffer.Size = shaderSource->GetBufferSize();
+        sourceBuffer.Encoding = DXC_CP_ACP;
+
+        // Compile shader
+        ComPtr<IDxcResult> dxcResult;
+        HRESULT hr = dxcCompiler->Compile(
+            &sourceBuffer,
+            args,
+            _countof(args),
+            dxcIncludeHandler.Get(),
+            IID_PPV_ARGS(&dxcResult)
+        );
+
+        // Check compilation result
+        ComPtr<IDxcBlobUtf8> errors;
+        dxcResult->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
+        if (errors && errors->GetStringLength() > 0) {
+            std::cout << "Shader compilation failed with error: " 
+                      << errors->GetStringPointer() << std::endl;
+        }
+
+        HRESULT status;
+        dxcResult->GetStatus(&status);
+        if (FAILED(status)) {
+            throw std::runtime_error("Failed to compile compute shader");
+        }
+
+        // Get compiled shader bytecode
+        ComPtr<IDxcBlob> computeShader;
+        dxcResult->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&computeShader), nullptr);
+
+        // Create PSO
+        D3D12_COMPUTE_PIPELINE_STATE_DESC computePsoDesc = {};
+        computePsoDesc.pRootSignature = rootSignature.Get();
+        computePsoDesc.CS = CD3DX12_SHADER_BYTECODE(computeShader->GetBufferPointer(), 
+            computeShader->GetBufferSize());
+        device->CreateComputePipelineState(&computePsoDesc, IID_PPV_ARGS(&pso));
     };
 
-    // Create compilation parameters
-    DxcBuffer sourceBuffer;
-    sourceBuffer.Ptr = shaderSource->GetBufferPointer();
-    sourceBuffer.Size = shaderSource->GetBufferSize();
-    sourceBuffer.Encoding = DXC_CP_ACP;
-
-    // Compile shader
-    ComPtr<IDxcResult> dxcResult;
-    HRESULT hr = dxcCompiler->Compile(
-        &sourceBuffer,     // source code
-        args,             // arguments
-        _countof(args),   // number of arguments
-        dxcIncludeHandler.Get(),  // include handler
-        IID_PPV_ARGS(&dxcResult)  // compilation result
-    );
-
-    // Check compilation result
-    ComPtr<IDxcBlobUtf8> errors;
-    dxcResult->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
-    if (errors && errors->GetStringLength() > 0) {
-        std::cout << "Shader compilation failed with error: " 
-                  << errors->GetStringPointer() << std::endl;
-    }
-
-    HRESULT status;
-    dxcResult->GetStatus(&status);
-    if (FAILED(status)) {
-        throw std::runtime_error("Failed to compile compute shader");
-    }
-
-    // Get compiled shader bytecode
-    ComPtr<IDxcBlob> computeShader;
-    dxcResult->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&computeShader), nullptr);
-
-    // Create PSO
-    D3D12_COMPUTE_PIPELINE_STATE_DESC computePsoDesc = {};
-    computePsoDesc.pRootSignature = rootSignature.Get();
-    computePsoDesc.CS = CD3DX12_SHADER_BYTECODE(computeShader->GetBufferPointer(), 
-        computeShader->GetBufferSize());
-    device->CreateComputePipelineState(&computePsoDesc, IID_PPV_ARGS(&pipelineState));
+    // Create all PSOs using the lambda
+    createPSO(L"../src/token_embedding.hlsl", psos->tokenEmbeddingPSO);
+    createPSO(L"../src/rms_norm.hlsl", psos->rmsNormPSO);
+    createPSO(L"../src/matmul.hlsl", psos->matMulPSO);
+    createPSO(L"../src/rope.hlsl", psos->ropePSO);
+    createPSO(L"../src/multi_head_attention.hlsl", psos->multiHeadAttentionPSO);
 }
 
 void create_run_state_gpu(RunStateGPU* s, Config* p, ID3D12Device* device, ID3D12DescriptorHeap* uavHeap, CD3DX12_CPU_DESCRIPTOR_HANDLE& handle) {
@@ -733,9 +749,99 @@ void UploadTransformerWeights(Transformer* transformer) {
     WaitForGpu();
 }
 
+void forward(ID3D12GraphicsCommandList* cmdList,
+    const Transformer* transformer,
+    const TransformerPSOs* psos, int token, int pos)
+{
+
+    // 设置全局根签名和描述符堆
+    ID3D12DescriptorHeap* heaps[] = { computeHeap.Get() };
+    cmdList->SetDescriptorHeaps(_countof(heaps), heaps);
+    cmdList->SetComputeRootSignature(rootSignature.Get());
+    cmdList->SetComputeRootDescriptorTable(0, computeHeap->GetGPUDescriptorHandleForHeapStart());
+
+    // Token Embedding
+    {
+        cmdList->SetPipelineState(psos->tokenEmbeddingPSO.Get());
+        UINT dispatchX = (transformer->config.dim + 255) / 256;
+        cmdList->Dispatch(dispatchX, 1, 1);
+    }
+    cmdList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::UAV(transformer->runstate_gpu.x.Get()));
+
+    // Layer loop
+    for (UINT l = 0; l < transformer->config.n_layers; l++) {
+
+
+        // Attention RMSNorm
+        {
+            cmdList->SetPipelineState(psos->rmsNormPSO.Get());
+            UINT dispatchX = (transformer->config.dim + 255) / 256;
+            cmdList->Dispatch(dispatchX, 1, 1);
+        }
+        cmdList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::UAV(transformer->runstate_gpu.xb.Get()));
+
+        // QKV MatMul
+        {
+            cmdList->SetPipelineState(psos->matMulPSO.Get());
+            UINT dispatchX = (transformer->config.dim + 15) / 16;
+            UINT dispatchY = (transformer->config.dim + 15) / 16;
+            cmdList->Dispatch(dispatchX, dispatchY, 1);
+        }
+
+        D3D12_RESOURCE_BARRIER barriers[] = {
+            CD3DX12_RESOURCE_BARRIER::UAV(transformer->runstate_gpu.q.Get()),
+            CD3DX12_RESOURCE_BARRIER::UAV(transformer->runstate_gpu.k.Get()),
+            CD3DX12_RESOURCE_BARRIER::UAV(transformer->runstate_gpu.v.Get())
+        };
+        cmdList->ResourceBarrier(3, barriers);
+
+        // RoPE encoding
+        {
+            cmdList->SetPipelineState(psos->ropePSO.Get());
+            UINT dispatchX = (transformer->config.dim + 255) / 256;
+            cmdList->Dispatch(dispatchX, 1, 1);
+            cmdList->Dispatch(dispatchX, 1, 1); // 分别处理 Q 和 K
+        }
+
+        D3D12_RESOURCE_BARRIER ropeBarriers[] = {
+            CD3DX12_RESOURCE_BARRIER::UAV(transformer->runstate_gpu.q.Get()),
+            CD3DX12_RESOURCE_BARRIER::UAV(transformer->runstate_gpu.k.Get())
+        };
+        cmdList->ResourceBarrier(2, ropeBarriers);
+
+        // Multi-head Attention
+        {
+            cmdList->SetPipelineState(psos->multiHeadAttentionPSO.Get());
+            UINT dispatchX = (transformer->config.n_heads + 31) / 32;
+            UINT dispatchY = (pos + 1 + 15) / 16; // Note: pos needs to be defined
+            cmdList->Dispatch(dispatchX, dispatchY, 1);
+        }
+        cmdList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::UAV(transformer->runstate_gpu.xb.Get()));
+    }
+
+    // Final RMSNorm and Classifier
+    {
+        // Final RMSNorm
+        cmdList->SetPipelineState(psos->rmsNormPSO.Get());
+        UINT dispatchX = (transformer->config.dim + 255) / 256;
+        cmdList->Dispatch(dispatchX, 1, 1);
+
+        cmdList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::UAV(transformer->runstate_gpu.x.Get()));
+    }
+    {
+        // Classifier MatMul
+        cmdList->SetPipelineState(psos->matMulPSO.Get());
+        UINT dispatchX = (transformer->config.vocab_size + 15) / 16;
+        UINT dispatchY = (transformer->config.dim + 15) / 16;
+        cmdList->Dispatch(dispatchX, dispatchY, 1);
+    }
+    cmdList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::UAV(transformer->runstate_gpu.logits.Get()));
+}
+
+
 // Execute compute shader 
-void ExecuteCompute(Transformer* transformer) {
-    commandList->Reset(commandAllocator.Get(), pipelineState.Get());
+void ExecuteCompute(Transformer* transformer, TransformerPSOs* transformer_pso) {
+    commandList->Reset(commandAllocator.Get(), transformer_pso->matMulPSO.Get());
     
     // Set descriptor heaps
     ID3D12DescriptorHeap* heaps[] = { computeHeap.Get() };
@@ -748,6 +854,7 @@ void ExecuteCompute(Transformer* transformer) {
     // Dispatch compute shader
     commandList->Dispatch(int(transformer->runstate_gpu.logits_size / 32), 1, 1);
 
+    forward(commandList.Get(), transformer, transformer_pso, 0, 0);
     // Add barrier to ensure computation is complete
     auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
         transformer->runstate_gpu.logits.Get(),
@@ -935,10 +1042,11 @@ int main(int argc, char* argv[]) {
     //    else { error_usage(); }
     //}
     Transformer transformer;
+    TransformerPSOs transformer_pso;
     read_checkpoint(checkpoint_path, &transformer.config, &transformer.weights, &transformer.file_handle, &transformer.data, &transformer.file_size);
 
     InitializeDevice();
-    CreateComputePipeline();
+    CreateComputePipeline(&transformer_pso);
     CreateResources(&transformer);
     CreateSyncObjects();
     CreateUploadAndReadBackBuffers(&transformer);
@@ -946,7 +1054,7 @@ int main(int argc, char* argv[]) {
 
     // Execute computation
     UploadTransformerWeights(&transformer);
-    ExecuteCompute(&transformer);
+    ExecuteCompute(&transformer, &transformer_pso);
     std::vector<float> result = ReadBackResult(&transformer);
     // Clean up resources
     CloseHandle(fenceEvent);
